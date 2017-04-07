@@ -3,8 +3,10 @@ from collections import namedtuple
 import math
 import argparse
 import sys
+import os
 import numpy as np
 import tensorflow as tf
+from tensorflow.contrib.tensorboard.plugins import projector
 
 word_index = 0
 sentence_index = 0
@@ -26,7 +28,6 @@ def main(_):
     valid_examples = np.append(valid_examples, dictionary['german'])
     valid_examples = np.append(valid_examples, dictionary['two'])
 
-
     # Train
     with tf.Graph().as_default():
         # input data
@@ -43,10 +44,19 @@ def main(_):
         # Variables.
         # embedding, vector for each word in the vocabulary
         embeddings = tf.Variable(
-            tf.random_uniform([vocabulary_size, FLAGS.embedding_size], -0.5, 0.5)
+            tf.random_uniform([vocabulary_size, FLAGS.embedding_size], -0.5, 0.5), name='word_embedding'
         )
-        embeddings = tf.concat([embeddings, tf.zeros([1, FLAGS.embedding_size])], 0)
+        embeddings = tf.concat([embeddings, tf.zeros([1, FLAGS.embedding_size])], 0, name='word_embedding')
         print("embedding shape is:%s" % embeddings.get_shape())
+        # Format
+        config = projector.ProjectorConfig()
+        # add embedding
+        embed2visual = config.embeddings.add()
+        embed2visual.tensor_name = embeddings.name
+        # Link this tensor to its metadata file 9e.g. labels)
+        embed2visual.metadata_path = os.path.join(FLAGS.log_dir, 'metadata.tsv')
+
+
         # para_embeddings = tf.Variable(
         #     tf.random_uniform([paragraph_size, FLAGS.embedding_size], -0.5, 0.5))
 
@@ -70,10 +80,15 @@ def main(_):
         reduced_embed = tf.div(tf.reduce_sum(embed, 1), FLAGS.skip_window + 1)
         print("reduced embed shape is:%s" % reduced_embed.shape)
 
+        # summary
         #
-        nce_weights = tf.Variable(tf.truncated_normal([vocabulary_size, FLAGS.embedding_size],
-                                                      stddev=1.0 / math.sqrt(FLAGS.embedding_size)))
-        nce_biases = tf.Variable(tf.zeros([vocabulary_size]))
+        with tf.name_scope('weights'):
+            nce_weights = tf.Variable(tf.truncated_normal([vocabulary_size, FLAGS.embedding_size],
+                                                          stddev=1.0 / math.sqrt(FLAGS.embedding_size)))
+            variable_summaries(nce_weights)
+        with tf.name_scope('biases'):
+            nce_biases = tf.Variable(tf.zeros([vocabulary_size]))
+            variable_summaries(nce_biases)
 
         loss = tf.reduce_mean(tf.nn.nce_loss(weights=nce_weights,
                                              biases=nce_biases,
@@ -81,6 +96,8 @@ def main(_):
                                              inputs=reduced_embed,
                                              num_sampled=FLAGS.num_sampled,
                                              num_classes=vocabulary_size))
+        # summary
+        tf.summary.scalar('nce_loss', loss)
 
         # Adagrad is required because there are too many things to optimize
         optimizer = tf.train.AdagradOptimizer(1.0).minimize(loss)
@@ -99,7 +116,18 @@ def main(_):
             tf.global_variables_initializer().run()
             print('Initialized')
 
+            merged = tf.summary.merge_all()
+            # summaries_writer = tf.summary.FileWriter(FLAGS.log_dir, session.graph)
+            # use the same log_dir to stored checkpoint
+            summaries_writer = tf.summary.FileWriter(FLAGS.log_dir, session.graph)
+
+            # write a projector_config.pbtxt in the log_dir
+            projector.visualize_embeddings(summaries_writer, config)
+
             average_loss = 0
+            # saver
+            saver = tf.train.Saver()
+
             for step in range(FLAGS.epochs):
                 batch_inputs, batch_cor, batch_labels, sen_len_T = generate_cor_batch(
                     data, vocabulary_size)
@@ -107,31 +135,37 @@ def main(_):
                 feed_dict = {train_inputs: batch_inputs, train_labels: batch_labels,
                              train_sentence_cor: batch_cor, train_sen_len_T: sen_len_T}
 
-                _, loss_val = session.run([optimizer, loss], feed_dict=feed_dict)
+                summary, _, loss_val = session.run([merged, optimizer, loss], feed_dict=feed_dict)
+                # write summaries
+                summaries_writer.add_summary(summary, step)
+
                 average_loss += loss_val
 
                 if step % 2000 == 0 and step > 0:
-                   average_loss /= 2000
-                   print("Average loss at step ", step, ": ", average_loss)
-                   average_loss = 0
+                    average_loss /= 2000
+                    print("Average loss at step ", step, ": ", average_loss)
+                    average_loss = 0
+                    # save check point
+                    saver.save(session, os.path.join(FLAGS.log_dir, 'model.ckpt'), step)
 
                 if step % 10000 == 0 and step > 0:
                     sim = similarity_w.eval()
                     for i in range(len(valid_examples)):
-                            valid_word = reverse_dictionary[valid_examples[i]]
-                            top_k = 8
-                            nearest = (-sim[i, :]).argsort()[1:top_k + 1]
-                            log_str = "Nearest to %s:" % valid_word
-                            for k in range(top_k):
-                                close_word = reverse_dictionary[nearest[k]]
-                                log_str = "%s %s," % (log_str, close_word)
-                            print(log_str)
+                        valid_word = reverse_dictionary[valid_examples[i]]
+                        top_k = 8
+                        nearest = (-sim[i, :]).argsort()[1:top_k + 1]
+                        log_str = "Nearest to %s:" % valid_word
+                        for k in range(top_k):
+                            close_word = reverse_dictionary[nearest[k]]
+                            log_str = "%s %s," % (log_str, close_word)
+                        print(log_str)
 
                 final_embeddings = normalized_embeddings.eval()
             #
             # get final embeddings
             final_embeddings = normalized_embeddings.eval()
             generate_corruption_sentence(final_embeddings, dictionary)
+
 
 def read_data(filename):
     LabelDoc = namedtuple('LabelDoc', 'words tags')
@@ -171,9 +205,11 @@ def build_dataset(input_data, min_cut_freq):
     # set word count for all the words to the current number of keys in the dictionary
     # in other words values act as indices for each word
     # first word is 'UNK' representing unknown words we encounter
-    for word, _ in count:
-        dictionary[word] = len(dictionary)
-
+    with open('log/metadata.tsv', 'w') as f:
+        for word, freq in count:
+            dictionary[word] = len(dictionary)
+            f.write("%s\t%s\n" % (word, freq))
+        f.close()
     # this contains the words replaced by assigned indices
     data = []
     unk_count = 0
@@ -194,7 +230,6 @@ def build_dataset(input_data, min_cut_freq):
     return data, count, dictionary, reverse_dictionary
 
 
-
 def generate_cor_batch(data, vocabulary_size):
     # skip window is the amount of words we're looking at from left side of a given word(Like Mikolov)
     # create a single batch
@@ -206,7 +241,7 @@ def generate_cor_batch(data, vocabulary_size):
     rp_sample = FLAGS.rp_sample
 
     span = skip_window + 1
-    batch = np.ndarray(shape=(batch_size, span-1), dtype=np.int32)
+    batch = np.ndarray(shape=(batch_size, span - 1), dtype=np.int32)
     batch_cor = np.ndarray(shape=(batch_size, max_sentence_length), dtype=np.int32)
     labels = np.ndarray(shape=(batch_size, 1), dtype=np.int32)
     # parag_labels = np.ndarray(shape=(batch_size, 1), dtype=np.int32)
@@ -222,7 +257,7 @@ def generate_cor_batch(data, vocabulary_size):
     for _ in range(span):
         buffer.append((data[sentence_index].words[word_index]))
         sent_len = len(data[sentence_index].words)
-        if sent_len - 1 == word_index: # reaching the end of a sentence
+        if sent_len - 1 == word_index:  # reaching the end of a sentence
             word_index = 0
             sentence_index = (sentence_index + 1) % len(data)
         else:
@@ -230,8 +265,8 @@ def generate_cor_batch(data, vocabulary_size):
 
     #
     for i in range(batch_size):
-        batch_temp = np.ndarray(shape=(span-1), dtype=np.int32)
-        for j in range(span-1):
+        batch_temp = np.ndarray(shape=(span - 1), dtype=np.int32)
+        for j in range(span - 1):
             batch_temp[j] = buffer[j]
         batch[i] = batch_temp
         labels[i, 0] = buffer[skip_window]
@@ -261,12 +296,12 @@ def generate_cor_batch(data, vocabulary_size):
         else:
             word_index += 1
 
-
     # return batch, batch_cor, labels, parag_labels, sentence_length_T
     return batch, batch_cor, labels, sentence_length_T
 
+
 def generate_corruption_sentence(embeddings, dictionary):
-    with open('format.txt') as fp, open('format.train.txt', 'w')as fpw:
+    with open('alldata.txt') as fp, open('doc2vector.txt', 'w')as fpw:
         for index, line in enumerate(fp):
             words_idx = []
             word_list = line.split()
@@ -297,6 +332,19 @@ def generate_corruption_sentence(embeddings, dictionary):
         fp.close()
 
 
+def variable_summaries(var):
+    """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
+    with tf.name_scope('summaries'):
+        mean = tf.reduce_sum(var)
+        tf.summary.scalar('mean', mean)
+        with tf.name_scope('stddev'):
+            stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
+        tf.summary.scalar('stddev', stddev)
+        tf.summary.scalar('max', tf.reduce_max(var))
+        tf.summary.scalar('min', tf.reduce_min(var))
+        tf.summary.histogram('histogram', var)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=128, help='batch size')
@@ -308,6 +356,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_sentence_length', type=int, default=100, help='limit sentence length to max')
     parser.add_argument('--rp_sample', type=float, default=0.1, help='the rate of corruption sample 1-q')
     parser.add_argument('--num_sampled', type=int, default=5, help='negative sampling, noise-contrastive estimation')
+    parser.add_argument('--log_dir', type=str, default='log/', help='summary log dir')
 
     FLAGS, unparsed = parser.parse_known_args()
     print('flags', FLAGS)
