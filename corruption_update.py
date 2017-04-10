@@ -31,85 +31,100 @@ def main(_):
     # Train
     with tf.Graph().as_default():
         # input data
-        train_inputs = tf.placeholder(tf.int32, shape=[FLAGS.batch_size, FLAGS.skip_window])
-        train_labels = tf.placeholder(tf.int32, shape=[FLAGS.batch_size, 1])
-        valid_dataset = tf.constant(valid_examples, dtype=tf.int32)
-        # paragraph vector placeholder
-        # train_parag_labels = tf.placeholder(tf.int32, shape=[FLAGS.batch_size, 1])
-        # doc2vecc placeholder
-        train_sentence_cor = tf.placeholder(tf.int32, shape=[FLAGS.batch_size, FLAGS.max_sentence_length])
-        train_sen_len_T = tf.placeholder(tf.float32, shape=[FLAGS.batch_size, 1])
+        with tf.name_scope('input'):
+            train_inputs = tf.placeholder(tf.int32, shape=[FLAGS.batch_size, FLAGS.skip_window], name='train_input')
+            train_labels = tf.placeholder(tf.int32, shape=[FLAGS.batch_size, 1], name='train_label')
+            valid_dataset = tf.constant(valid_examples, dtype=tf.int32, name='validation_data')
+            # paragraph vector placeholder
+            # train_parag_labels = tf.placeholder(tf.int32, shape=[FLAGS.batch_size, 1])
+            # doc2vecc placeholder
+            train_sentence_cor = tf.placeholder(tf.int32, shape=[FLAGS.batch_size, FLAGS.max_sentence_length],
+                                                name='corruption_sentence')
+            train_sen_len_T = tf.placeholder(tf.float32, shape=[FLAGS.batch_size, 1], name='sentence_length')
 
-        # build a graph
-        # Variables.
-        # embedding, vector for each word in the vocabulary
-        embeddings = tf.Variable(
-            tf.random_uniform([vocabulary_size, FLAGS.embedding_size], -0.5, 0.5), name='word_embedding'
-        )
-        embeddings = tf.concat([embeddings, tf.zeros([1, FLAGS.embedding_size])], 0, name='word_embedding')
-        print("embedding shape is:%s" % embeddings.get_shape())
-        # Format
+            # build a graph
+            # Variables.
+            # embedding, vector for each word in the vocabulary
+            with tf.name_scope('embeddings'):
+                embeddings = tf.Variable(
+                    tf.random_uniform([vocabulary_size, FLAGS.embedding_size], -0.5, 0.5),
+                )
+                # print("embedding type is: %s"%type(embeddings))
+
+                # embeddings = tf.concat([embeddings, tf.zeros([1, FLAGS.embedding_size])], 0)
+                print("embedding shape is:%s" % embeddings.get_shape())
+                # print("embedding type is: %s"%type(embeddings))
+
+        # visualization embeddings
         config = projector.ProjectorConfig()
         # add embedding
         embed2visual = config.embeddings.add()
         embed2visual.tensor_name = embeddings.name
         # Link this tensor to its metadata file 9e.g. labels)
-        embed2visual.metadata_path = os.path.join(FLAGS.log_dir, 'metadata.tsv')
-
+        embed2visual.metadata_path = os.path.abspath(os.path.join(FLAGS.log_dir, 'metadata.tsv'))
 
         # para_embeddings = tf.Variable(
         #     tf.random_uniform([paragraph_size, FLAGS.embedding_size], -0.5, 0.5))
 
-        embed_word = tf.nn.embedding_lookup(embeddings, train_inputs)
-        print("embed word shape is:%s" % embed_word.shape)
-        # embed_para = tf.nn.embedding_lookup(para_embeddings, train_parag_labels)
-        # print("embed para shape is:%s"%embed_para.shape)
+        with tf.name_scope('lookup-layer'):
+            embed_word = tf.nn.embedding_lookup(embeddings, train_inputs, name='word_lookup')
+            print("embed word shape is:%s" % embed_word.shape)
+            # embed_para = tf.nn.embedding_lookup(para_embeddings, train_parag_labels)
+            # print("embed para shape is:%s"%embed_para.shape)
+            # sentence corruption embeddings
+            embed_cor = tf.nn.embedding_lookup(embeddings, train_sentence_cor, name='sentence_lookup')
+            print("embed cor shape is: %s" % embed_cor.shape)
 
-        # sentence corruption embeddings
-        embed_cor = tf.nn.embedding_lookup(embeddings, train_sentence_cor)
-        print("embed cor shape is: %s" % embed_cor.shape)
-        embed_cor_scale = tf.div(10.0, train_sen_len_T)
-        # print(embed_cor_scale)
-        print("embed_cor_scale shape is: %s" % embed_cor_scale.shape)
-        embed_c = tf.multiply(tf.reduce_sum(embed_cor, 1, keep_dims=True), embed_cor_scale)
-        print("embed_c shape is: %s" % embed_c.shape)
-        corrpution = tf.reduce_sum(embed_c, 1, keep_dims=True)
-        print("reduce embed_c %s" % corrpution.shape)
-        embed = tf.concat([embed_word, corrpution], 1)
-        print("embed shape is:%s" % embed.shape)
-        reduced_embed = tf.div(tf.reduce_sum(embed, 1), FLAGS.skip_window + 1)
-        print("reduced embed shape is:%s" % reduced_embed.shape)
+            with tf.name_scope('construct_corruption'):
+                embed_cor_scale = tf.div(10.0, train_sen_len_T, name='scale')
+                # print(type(embed_cor_scale))
+                embed_cor_scale_reshape = tf.reshape(embed_cor_scale, [128, 1, 1])
+                print("embed_cor_scale shape is: %s" % embed_cor_scale.shape)
+                embed_c = tf.multiply(tf.reduce_sum(embed_cor, 1, keep_dims=True), embed_cor_scale_reshape)
+                print("embed_c shape is: %s" % embed_c.shape)
+                # corruption = tf.reduce_sum(embed_c, 1, keep_dims=True)
+                # print("reduce embed_c %s" % corruption.shape)
+
+        with tf.name_scope('projection-layer'):
+            embed = tf.concat([embed_word, embed_c], 1)
+            print("embed shape is:%s" % embed.shape)
+            reduced_embed = tf.div(tf.reduce_sum(embed, 1), FLAGS.skip_window + 1)
+            print("reduced embed shape is:%s" % reduced_embed.shape)
 
         # summary
         #
-        with tf.name_scope('weights'):
-            nce_weights = tf.Variable(tf.truncated_normal([vocabulary_size, FLAGS.embedding_size],
-                                                          stddev=1.0 / math.sqrt(FLAGS.embedding_size)))
-            variable_summaries(nce_weights)
-        with tf.name_scope('biases'):
-            nce_biases = tf.Variable(tf.zeros([vocabulary_size]))
-            variable_summaries(nce_biases)
+            with tf.name_scope('weights'):
+                nce_weights = tf.Variable(tf.truncated_normal([vocabulary_size, FLAGS.embedding_size],
+                                                              stddev=1.0 / math.sqrt(FLAGS.embedding_size)), name='nce_weights')
+                variable_summaries(nce_weights)
+            with tf.name_scope('biases'):
+                nce_biases = tf.Variable(tf.zeros([vocabulary_size]), name='nce_weights')
+                variable_summaries(nce_biases)
 
-        loss = tf.reduce_mean(tf.nn.nce_loss(weights=nce_weights,
-                                             biases=nce_biases,
-                                             labels=train_labels,
-                                             inputs=reduced_embed,
-                                             num_sampled=FLAGS.num_sampled,
-                                             num_classes=vocabulary_size))
-        # summary
-        tf.summary.scalar('nce_loss', loss)
+            with tf.name_scope('nce_loss'):
+                loss = tf.reduce_mean(tf.nn.nce_loss(weights=nce_weights,
+                                                     biases=nce_biases,
+                                                     labels=train_labels,
+                                                     inputs=reduced_embed,
+                                                     num_sampled=FLAGS.num_sampled,
+                                                     num_classes=vocabulary_size,
+                                                     name='nce_loss'), name='loss')
+                # summary
+                tf.summary.scalar('nce-loss', loss)
 
-        # Adagrad is required because there are too many things to optimize
-        optimizer = tf.train.AdagradOptimizer(1.0).minimize(loss)
+            with tf.name_scope('train'):
+                # Adagrad is required because there are too many things to optimize
+                optimizer = tf.train.AdagradOptimizer(1.0).minimize(loss)
 
-        # compute the similarity between minibatch examples and all embeddings.
-        # We use the cosine distance
-        norm = tf.sqrt(tf.reduce_sum(tf.square(embeddings), 1, keep_dims=True))
-        normalized_embeddings = embeddings / norm
+        with tf.name_scope('normalization'):
+            # compute the similarity between minibatch examples and all embeddings.
+            norm = tf.sqrt(tf.reduce_sum(tf.square(embeddings), 1, keep_dims=True))
+            normalized_embeddings = embeddings / norm
         # para_norm = tf.sqrt(tf.reduce_sum(tf.square(para_embeddings), 1, keep_dims=True))
         # normalized_para_embeddings = para_embeddings / para_norm
-        valid_embeddings = tf.nn.embedding_lookup(normalized_embeddings, valid_dataset)
-        similarity_w = tf.matmul(valid_embeddings, tf.transpose(normalized_embeddings))
+        with tf.name_scope('test'):
+            valid_embeddings = tf.nn.embedding_lookup(normalized_embeddings, valid_dataset)
+            similarity_w = tf.matmul(valid_embeddings, tf.transpose(normalized_embeddings))
 
         #
         with tf.Session() as session:
@@ -129,15 +144,24 @@ def main(_):
             saver = tf.train.Saver()
 
             for step in range(FLAGS.epochs):
+                # get a batch of data
                 batch_inputs, batch_cor, batch_labels, sen_len_T = generate_cor_batch(
                     data, vocabulary_size)
 
                 feed_dict = {train_inputs: batch_inputs, train_labels: batch_labels,
                              train_sentence_cor: batch_cor, train_sen_len_T: sen_len_T}
-
-                summary, _, loss_val = session.run([merged, optimizer, loss], feed_dict=feed_dict)
-                # write summaries
-                summaries_writer.add_summary(summary, step)
+                # record execution stats
+                if step % 100 == 99:
+                    run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+                    run_metadata = tf.RunMetadata()
+                    summary, _, loss_val = session.run([merged, optimizer, loss], feed_dict=feed_dict,
+                                                       options=run_options, run_metadata=run_metadata)
+                    summaries_writer.add_run_metadata(run_metadata, 'step%03d' % step)
+                    summaries_writer.add_summary(summary, step)
+                else: # record a summary
+                    summary, _, loss_val = session.run([merged, optimizer, loss], feed_dict=feed_dict)
+                    # write summaries
+                    summaries_writer.add_summary(summary, step)
 
                 average_loss += loss_val
 
@@ -148,7 +172,7 @@ def main(_):
                     # save check point
                     saver.save(session, os.path.join(FLAGS.log_dir, 'model.ckpt'), step)
 
-                if step % 10000 == 0 and step > 0:
+                if step % 100 == 0 and step > 0:
                     sim = similarity_w.eval()
                     for i in range(len(valid_examples)):
                         valid_word = reverse_dictionary[valid_examples[i]]
@@ -159,6 +183,7 @@ def main(_):
                             close_word = reverse_dictionary[nearest[k]]
                             log_str = "%s %s," % (log_str, close_word)
                         print(log_str)
+                    print("====================>")
 
                 final_embeddings = normalized_embeddings.eval()
             #
@@ -172,13 +197,17 @@ def read_data(filename):
     all_docs = []
     count = 0
     with open(filename) as f:
+        total_words = 0
         for line in iter(f):
             tag = ['SEN_' + str(count)]
             count += 1
-            all_docs.append(LabelDoc(line.split(), tag))
+            words = line.split()
+            total_words += len(words)
+            all_docs.append(LabelDoc(words, tag))
             # if count > 10001:
             #     break
     # print("max is: %s and min is: %s and avg is: %s"%(max(leng), min(leng), float(sum(leng))/len(leng)))
+    print('Total words length is: %s' %total_words)
     return all_docs
 
 
@@ -206,9 +235,11 @@ def build_dataset(input_data, min_cut_freq):
     # in other words values act as indices for each word
     # first word is 'UNK' representing unknown words we encounter
     with open('log/metadata.tsv', 'w') as f:
+        f.write("word\tfreq\n")
         for word, freq in count:
             dictionary[word] = len(dictionary)
             f.write("%s\t%s\n" % (word, freq))
+        # f.write("PAD\t0\n")
         f.close()
     # this contains the words replaced by assigned indices
     data = []
@@ -286,7 +317,7 @@ def generate_cor_batch(data, vocabulary_size):
                 break
         if already_sampled <= max_sentence_length:
             while max_sentence_length - already_sampled > 0:
-                batch_tmp_cor[already_sampled] = vocabulary_size
+                batch_tmp_cor[already_sampled] = 0#vocabulary_size
                 already_sampled += 1
         batch_cor[i] = batch_tmp_cor
 
@@ -355,7 +386,7 @@ if __name__ == '__main__':
     parser.add_argument('--min_cut_freq', type=int, default=9, help='min cut frequent words')
     parser.add_argument('--max_sentence_length', type=int, default=100, help='limit sentence length to max')
     parser.add_argument('--rp_sample', type=float, default=0.1, help='the rate of corruption sample 1-q')
-    parser.add_argument('--num_sampled', type=int, default=5, help='negative sampling, noise-contrastive estimation')
+    parser.add_argument('--num_sampled', type=int, default=64, help='negative sampling, noise-contrastive estimation')
     parser.add_argument('--log_dir', type=str, default='log/', help='summary log dir')
 
     FLAGS, unparsed = parser.parse_known_args()
